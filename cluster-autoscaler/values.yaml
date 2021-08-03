@@ -1,0 +1,300 @@
+cluster-autoscaler:
+  # Replace after 4 May
+  image:
+    repository: dteamdev/cluster-autoscaler-hetzner-amd64
+    tag: dev
+
+  autoscalingGroups:
+    - name: CX41:FSN1:worker
+      maxSize: 7
+      minSize: 3
+
+  cloudProvider: hetzner
+
+  extraArgs:
+    node-autoprovisioning-enabled: true
+
+  tolerations:
+    - effect: NoSchedule
+      key: node-role.kubernetes.io/master
+
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchExpressions:
+              - key: node-role.kubernetes.io/master
+                operator: Exists
+
+  extraEnv:
+    HCLOUD_SSH_KEY: main_ssh_key-d761732
+    HCLOUD_NETWORK: node_vpc-28c35e6
+  extraEnvSecrets:
+    HCLOUD_TOKEN:
+      name: cluster-autoscaler-secret
+      key: hcloudToken
+    HCLOUD_CLOUD_INIT:
+      key: cloudInit
+      name: cluster-autoscaler-secret
+
+  serviceMonitor:
+    enabled: true
+
+  prometheusRule:
+    enabled: true
+
+hcloudToken: <YOUR_HCLOUD_TOKEN>
+cloudInit: |-
+    #!/bin/bash
+    K8S_VERSION="1.20.5-00"
+    CONTAINERD_VERSION="1.4.4-1"
+
+    export DEBIAN_FRONTEND=noninteractive
+    export HOME=/root/
+
+    # Install packages
+    apt update && apt upgrade -y && apt install -y \
+      apt-transport-https \
+      ca-certificates \
+      curl \
+      software-properties-common \
+      htop \
+      wget \
+      gnupg \
+      lsb-release
+
+    # Install containerd
+    cat <<EOF | tee /etc/modules-load.d/containerd.conf
+    overlay
+    br_netfilter
+    EOF
+
+    modprobe overlay
+    modprobe br_netfilter
+
+    # Setup required sysctl params, these persist across reboots.
+    cat <<EOF | tee /etc/sysctl.d/99-kubernetes-cri.conf
+    net.bridge.bridge-nf-call-iptables  = 1
+    net.ipv4.ip_forward                 = 1
+    net.bridge.bridge-nf-call-ip6tables = 1
+    EOF
+
+    # Apply sysctl params without reboot
+    sysctl --system
+    apt-get remove docker docker-engine docker.io containerd runc
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
+    echo \
+      "deb [arch=amd64 signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu \
+      $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list >/dev/null
+    apt update
+    apt install -y containerd.io=$CONTAINERD_VERSION
+    apt-mark containerd.io
+    mkdir -p /etc/containerd
+    containerd config default | tee /etc/containerd/config.toml
+    systemctl restart containerd
+    # Use systemd cgroups driver
+    perl -i -p0e 's/options\]/options\]\n            SystemdCgroup = true/s'
+    systemctl restart containerd
+
+    curl -fsSLo /usr/share/keyrings/kubernetes-archive-keyring.gpg https://packages.cloud.google.com/apt/doc/apt-key.gpg
+    echo "deb [signed-by=/usr/share/keyrings/kubernetes-archive-keyring.gpg] https://apt.kubernetes.io/ kubernetes-xenial main" | tee /etc/apt/sources.list.d/kubernetes.list
+    apt update
+    apt install -y kubelet=1.20.5-00 kubeadm=1.20.5-00 kubectl=1.20.5-00
+    apt-mark hold kubelet kubeadm kubectl
+
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg | apt-key add -
+    curl -s https://packages.cloud.google.com/apt/doc/apt-key.gpg | apt-key add -
+    cat <<EOF >/etc/apt/sources.list.d/kubernetes.list
+    deb https://apt.kubernetes.io/ kubernetes-xenial main
+    EOF
+    add-apt-repository "deb [arch=amd64] https://download.docker.com/linux/ubuntu   $(lsb_release -cs)   stable"
+
+    apt-get install -y kubelet=$K8s_VERSION kubeadm=$K8s_VERSION kubectl=$K8s_VERSION
+
+    cat <<EOF | tee /etc/crictl.yaml
+    runtime-endpoint: unix:///run/containerd/containerd.sock
+    image-endpoint: unix:///run/containerd/containerd.sock
+    timeout: 2
+    EOF
+
+    # setup nginx proxy
+    mkdir /etc/nginx
+    cat <<EOF | tee /etc/nginx/nginx.conf
+    error_log stderr notice;
+
+    worker_processes 2;
+    worker_rlimit_nofile 130048;
+    worker_shutdown_timeout 10s;
+
+    events {
+      multi_accept on;
+      use epoll;
+      worker_connections 16384;
+    }
+
+    stream {
+      upstream kube_apiserver {
+        least_conn;
+        # Modify master IP's here
+        server 10.0.0.2:6443;
+        server 10.0.0.3:6443;
+        server 10.0.0.4:6443;
+        }
+
+      server {
+        listen        127.0.0.1:6443;
+        proxy_pass    kube_apiserver;
+        proxy_timeout 10m;
+        proxy_connect_timeout 1s;
+      }
+    }
+
+    http {
+      aio threads;
+      aio_write on;
+      tcp_nopush on;
+      tcp_nodelay on;
+
+      keepalive_timeout 5m;
+      keepalive_requests 100;
+      reset_timedout_connection on;
+      server_tokens off;
+      autoindex off;
+
+      server {
+        listen 8081;
+        location /healthz {
+          access_log off;
+          return 200;
+        }
+        location /stub_status {
+          stub_status on;
+          access_log off;
+        }
+      }
+      }
+    EOF
+
+    cat << EOF | tee /etc/systemd/system/kubelet.service.d/20-kubelet-standalone.conf
+    [Service]
+    ExecStart=
+    ExecStart=/usr/bin/kubelet --address=127.0.0.1 --pod-manifest-path=/etc/kubernetes/manifests --cgroup-driver=systemd --container-runtime=remote --runtime-request-timeout=15m --container-runtime-endpoint=unix:///run/containerd/containerd.sock
+    Restart=always
+    EOF
+
+    systemctl daemon-reload
+    systemctl restart kubelet
+
+    cat <<EOF | tee /etc/kubernetes/manifests/nginx-proxy.yml
+    apiVersion: v1
+    kind: Pod
+    metadata:
+      name: nginx-proxy
+      namespace: kube-system
+      labels:
+        addonmanager.kubernetes.io/mode: Reconcile
+        k8s-app: kube-nginx
+      annotations:
+        nginx-cfg-checksum: "e4948da51bcd19346d5314ab10259e665f081e5c"
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      nodeSelector:
+        kubernetes.io/os: linux
+      priorityClassName: system-node-critical
+      containers:
+      - name: nginx-proxy
+        image: docker.io/library/nginx:1.19
+        imagePullPolicy: IfNotPresent
+        resources:
+          requests:
+            cpu: 25m
+            memory: 32M
+        securityContext:
+          privileged: true
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 8081
+        readinessProbe:
+          httpGet:
+            path: /healthz
+            port: 8081
+        volumeMounts:
+        - mountPath: /etc/nginx
+          name: etc-nginx
+          readOnly: true
+      volumes:
+      - name: etc-nginx
+        hostPath:
+          path: /etc/nginx
+    EOF
+
+    echo "Waiting for nginx-proxy to Setup"
+    max_retry=5
+    counter=0
+    until crictl logs $(crictl ps --label io.kubernetes.container.name=nginx-proxy -q -n 1)
+    do
+       sleep 15
+       [[ counter -eq $max_retry ]] && echo "Failed!" && exit 1
+       echo "Trying again. Try #$counter"
+       ((counter++))
+    done
+
+    rm /etc/systemd/system/kubelet.service.d/20-kubelet-standalone.conf
+    systemctl daemon-reload
+
+    mkdir /etc/kubernetes/pki
+    ln -s /etc/kubernetes/pki/ /etc/kubernetes/ssl
+
+    TAINTS=""
+    LABELS=""
+
+    # DEFINE NODE LABELS
+    case $(hostname) in
+      *"service"*)
+    TAINTS=$(cat <<-END
+      taints:
+      - key: node-role.kubernetes.io/internal-services
+        effect: NoSchedule
+    END
+    )
+    LABELS="node-labels: node.kubernetes.io/role='internal-services'"
+      ;;
+      *"postgres"*)
+    TAINTS=$(cat <<-END
+      taints:
+      - key: node-role.kubernetes.io/database
+        effect: NoSchedule
+    END
+    )
+    LABELS="node-labels: node.kubernetes.io/role='database'"
+      ;;
+    esac
+
+    cat << EOF | tee /etc/kubernetes/config.yaml
+    apiVersion: kubeadm.k8s.io/v1beta2
+    kind: JoinConfiguration
+    caCertPath: /etc/kubernetes/pki/ca.crt
+    discovery:
+      bootstrapToken:
+        apiServerEndpoint: 127.0.0.1:6443
+        token: <YOUR_TOKEN_HERE>
+        unsafeSkipCAVerification: true
+      timeout: 5m0s
+      tlsBootstrapToken: <YOUR_TOKEN_HERE>
+    nodeRegistration:
+      criSocket: /run/containerd/containerd.sock
+      name: $(hostname)
+      kubeletExtraArgs:
+        cloud-provider: external
+        cgroup-driver: systemd
+        runtime-request-timeout: 15m
+        kube-reserved: cpu=100m,memory=100Mi
+        system-reserved: cpu=100m,memory=300Mi
+        $LABELS
+    $TAINTS
+    EOF
+
+    kubeadm join --config /etc/kubernetes/config.yaml \
+      --ignore-preflight-errors=DirAvailable--etc-kubernetes-manifests,Port-10250
